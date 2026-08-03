@@ -1,0 +1,4 @@
+gradio>=4.36.0
+convert_to_quant
+safetensors>=0.4.0
+scipy
