@@ -19,7 +19,7 @@ made via `UNETLoader` with `weight_dtype: fp8_e4m3fn_fast`, or downloaded as an
 `*_fp8*.safetensors` file), start on the Dequantize tab — don't feed it straight
 into ConvRot.**
 
-Why this matters: many FP8 checkpoints store weights as `raw_fp8_value` plus a
+Many FP8 checkpoints store weights as `raw_fp8_value` plus a
 **separate per-layer `.weight_scale` tensor**, where the real value is
 `raw_fp8_value.float() * weight_scale`. If a quantizer doesn't know about that
 scale tensor and treats the raw FP8 bits as the final weight, every value it
