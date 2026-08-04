@@ -7,6 +7,9 @@ import traceback
 from pathlib import Path
 
 import gradio as gr
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 PRESET_CHOICES = [
     "(none)",
@@ -18,6 +21,7 @@ PRESET_CHOICES = [
 ]
 
 FP8_DTYPE_NAMES = {"F8_E4M3", "F8_E5M2"}
+FP8_TORCH_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
 
 # Documented "K2" exclusion profile for Krea2 ConvRot conversions: these layers
 # should stay at higher precision (per community Krea2 ConvRot releases).
@@ -33,6 +37,22 @@ def read_safetensors_header(path):
     return header
 
 
+def find_companion_scale(key, all_keys):
+    """Look for a common per-layer scale-tensor naming convention next to a weight key."""
+    base = key[: -len(".weight")] if key.endswith(".weight") else key
+    candidates = [
+        key + "_scale",
+        key + ".scale",
+        base + ".scale_weight",
+        base + ".weight_scale",
+        base + "_scale",
+    ]
+    for c in candidates:
+        if c in all_keys:
+            return c
+    return None
+
+
 def scan_fp8_bias_layers(path):
     """Return sorted layer prefixes (key without '.bias') whose bias tensor is FP8."""
     header = read_safetensors_header(path)
@@ -43,6 +63,183 @@ def scan_fp8_bias_layers(path):
         if key.endswith(".bias") and info.get("dtype") in FP8_DTYPE_NAMES:
             layers.append(key[: -len(".bias")])
     return sorted(set(layers))
+
+
+def scan_fp8_scale_metadata(path):
+    """Check whether FP8 weight tensors have a companion per-layer scale tensor
+    (scaled FP8) or not (naive FP8)."""
+    header = read_safetensors_header(path)
+    all_keys = set(header.keys())
+    fp8_weight_keys = [
+        k for k, v in header.items()
+        if k != "__metadata__" and k.endswith(".weight") and v.get("dtype") in FP8_DTYPE_NAMES
+    ]
+    scaled, unscaled = [], []
+    for k in fp8_weight_keys:
+        companion = find_companion_scale(k, all_keys)
+        (scaled if companion else unscaled).append((k, companion))
+    return {
+        "total_fp8_weights": len(fp8_weight_keys),
+        "scaled": scaled,
+        "unscaled": unscaled,
+        "metadata": header.get("__metadata__", {}) or {},
+    }
+
+
+def scan_scale_metadata_ui(uploaded_file, manual_path):
+    try:
+        if manual_path and manual_path.strip():
+            path = manual_path.strip()
+        elif uploaded_file is not None:
+            path = uploaded_file.name
+        else:
+            raise gr.Error("Provide a checkpoint via upload or path first.")
+
+        path = Path(path)
+        if not path.is_file():
+            raise gr.Error(f"Input file not found: {path}")
+
+        info = scan_fp8_scale_metadata(path)
+        log = (
+            f"FP8 weight tensors: {info['total_fp8_weights']}\n"
+            f"  - with a companion scale tensor (scaled FP8): {len(info['scaled'])}\n"
+            f"  - with no companion scale tensor (naive FP8): {len(info['unscaled'])}\n\n"
+        )
+        if info["scaled"]:
+            log += "Example scaled pairs:\n" + "\n".join(
+                f"  {w} -> {s}" for w, s in info["scaled"][:8]
+            ) + "\n\n"
+        if info["unscaled"]:
+            log += "Example unscaled weights:\n" + "\n".join(
+                f"  {w}" for w, _ in info["unscaled"][:8]
+            ) + "\n\n"
+        if info["metadata"]:
+            log += f"File metadata: {info['metadata']}\n\n"
+
+        if info["scaled"] and not info["unscaled"]:
+            log += (
+                "=> This looks like SCALED FP8. Use the Dequantize step below "
+                "before running INT8 ConvRot conversion, or ctq will quantize "
+                "the raw unscaled FP8 values directly, producing garbage output."
+            )
+        elif info["unscaled"] and not info["scaled"]:
+            log += (
+                "=> This looks like NAIVE FP8 (no companion scale found). "
+                "Dequantizing to BF16 first is still recommended for best "
+                "results, but the scale-mismatch risk described above doesn't apply."
+            )
+        else:
+            log += "=> Mixed: some weights scaled, some not. Dequantizing first is recommended."
+        return log
+    except gr.Error:
+        raise
+    except Exception as e:
+        return f"Error: {e}\n\n{traceback.format_exc()}"
+
+
+def dequantize_fp8_to_bf16(input_path, output_path, progress):
+    tensors = {}
+    metadata = {}
+    stats_log = []
+
+    with safe_open(str(input_path), framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        all_keys = set(keys)
+        meta = f.metadata()
+        if meta:
+            metadata.update(meta)
+
+        # Only mark a "*_scale"/"*.scale" tensor as consumed if it is the
+        # confirmed companion of an actual FP8 weight tensor. Never skip by
+        # name pattern alone — real model weights (e.g. a norm layer's
+        # learnable "scale"/gain parameter) can share these suffixes and
+        # must be copied through untouched.
+        header = read_safetensors_header(input_path)
+        fp8_weight_keys = [
+            k for k, v in header.items()
+            if k != "__metadata__" and k.endswith(".weight") and v.get("dtype") in FP8_DTYPE_NAMES
+        ]
+        companion_map = {}
+        consumed_keys = set()
+        for wk in fp8_weight_keys:
+            companion = find_companion_scale(wk, all_keys)
+            if companion is not None:
+                companion_map[wk] = companion
+                consumed_keys.add(companion)
+
+        n = len(keys)
+        n_dequant, n_copied, n_sample_logged = 0, 0, 0
+
+        for i, key in enumerate(keys):
+            progress((i + 1) / n, desc=f"Processing {key}")
+            if key in consumed_keys:
+                continue
+
+            tensor = f.get_tensor(key)
+            if tensor.dtype in FP8_TORCH_DTYPES:
+                companion = companion_map.get(key)
+                t = tensor.to(torch.float32)
+                if companion is not None:
+                    scale = f.get_tensor(companion).to(torch.float32)
+                    t = t * scale
+                bf16 = t.to(torch.bfloat16)
+                tensors[key] = bf16
+                n_dequant += 1
+                if n_sample_logged < 6:
+                    stats_log.append(
+                        f"  {key}: scale={'yes (' + companion + ')' if companion else 'no'}, "
+                        f"abs-mean={bf16.float().abs().mean().item():.5f}, "
+                        f"abs-max={bf16.float().abs().max().item():.5f}"
+                    )
+                    n_sample_logged += 1
+            else:
+                tensors[key] = tensor
+                n_copied += 1
+
+    metadata["dequantized_from_fp8"] = "true"
+    save_file(tensors, str(output_path), metadata=metadata)
+
+    log = (
+        f"Dequantized {n_dequant} FP8 tensors to BF16 (using embedded scale where found).\n"
+        f"Copied {n_copied} other tensors unchanged.\n\n"
+        f"Sample dequantized tensor stats (sanity check — values should look like "
+        f"typical near-unit-scale weights, not near-zero or huge):\n"
+        + "\n".join(stats_log)
+        + f"\n\nSaved to: {output_path}"
+    )
+    return log, str(output_path)
+
+
+def run_dequantize(uploaded_file, manual_path, output_name, progress=gr.Progress()):
+    try:
+        if manual_path and manual_path.strip():
+            input_path = manual_path.strip()
+        elif uploaded_file is not None:
+            input_path = uploaded_file.name
+        else:
+            raise gr.Error("Provide a checkpoint via upload or path first.")
+
+        input_path = Path(input_path)
+        if not input_path.is_file():
+            raise gr.Error(f"Input file not found: {input_path}")
+
+        out_dir = Path("outputs")
+        out_dir.mkdir(exist_ok=True)
+
+        if output_name and output_name.strip():
+            out_name = output_name.strip()
+            if not out_name.endswith(".safetensors"):
+                out_name += ".safetensors"
+        else:
+            out_name = input_path.stem + "_bf16.safetensors"
+
+        output_path = out_dir / out_name
+        log, saved_path = dequantize_fp8_to_bf16(input_path, output_path, progress)
+        return log, saved_path
+    except gr.Error:
+        raise
+    except Exception as e:
+        return f"Error: {e}\n\n{traceback.format_exc()}", None
 
 
 def scan_for_fp8_biases(uploaded_file, manual_path, current_pattern):
@@ -206,84 +403,120 @@ def list_presets():
 with gr.Blocks(title="Krea2 INT8 ConvRot Converter") as demo:
     gr.Markdown("# Krea2 Checkpoint: INT8 ConvRot Converter")
     gr.Markdown(
-        "Wraps the `ctq` CLI from "
-        "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) "
-        "to quantize a `.safetensors` checkpoint to INT8, with an optional group-wise "
-        "Hadamard rotation (**ConvRot**) applied before quantization to suppress "
-        "weight outliers and improve accuracy versus plain INT8.\n\n"
+        "**If your source checkpoint is already FP8** (e.g. a LoRA merged into an "
+        "FP8 base), start on the **Dequantize** tab first. Re-quantizing raw FP8 "
+        "values straight to INT8 can produce total noise if the FP8 weights are "
+        "stored with a separate per-layer scale tensor that the quantizer doesn't "
+        "know about. Dequantizing to BF16 first (using that embedded scale) fixes "
+        "this before ConvRot ever runs.\n\n"
         "**Note:** as of this writing, ComfyUI's native diffusion-model loader does "
         "not reliably run Krea2 ConvRot INT8 checkpoints — use a ConvRot-aware "
         "custom node (e.g. ComfyUI-INT8-Fast / its SparknightLLC fork, or "
         "WINT8-ComfyUI), and set that node's `model_type` explicitly to `krea2` "
-        "rather than `auto`.\n\n"
-        "The exclude-layers field below defaults to the documented Krea2 'K2' "
-        "profile (`first, last, tmlp, tproj, txtfusion, txtmlp` kept unquantized) "
-        "— clear it only if you know your checkpoint uses different layer names."
+        "rather than `auto`."
     )
 
-    with gr.Row():
-        with gr.Column():
-            file_input = gr.File(label="Upload checkpoint (.safetensors)", file_types=[".safetensors"])
-            path_input = gr.Textbox(
-                label="Or local file path (recommended for large checkpoints)",
-                placeholder=r"C:\models\krea2_fp8.safetensors",
-            )
-            output_name = gr.Textbox(
-                label="Output filename (optional)",
-                placeholder="krea2_int8_convrot.safetensors",
-            )
-
-            use_int8 = gr.Checkbox(label="INT8 quantize (--int8)", value=True)
-            scaling_mode = gr.Radio(["row", "tensor", "block"], value="row", label="Scaling mode")
-            block_size = gr.Number(label="Block size (only used if scaling mode = block)", value=128, precision=0)
-
-            use_simple = gr.Checkbox(
-                label="Simple mode / skip learned rounding (--simple) — much faster, slightly lower fidelity",
-                value=True,
-            )
-            use_low_memory = gr.Checkbox(label="Low memory mode (--low-memory)", value=True)
-
-            use_convrot = gr.Checkbox(label="Apply ConvRot (Hadamard rotation)", value=True)
-            convrot_group_size = gr.Radio(["64", "256", "1024"], value="256", label="ConvRot group size")
-
-            use_comfy_quant = gr.Checkbox(label="ComfyUI-compatible metadata (--comfy_quant)", value=True)
-            save_metadata = gr.Checkbox(label="Save quant metadata (--save-quant-metadata)", value=True)
-
-            preset = gr.Dropdown(PRESET_CHOICES, value="(none)", label="Architecture preset (layer exclusions)")
-            custom_preset_flag = gr.Textbox(
-                label="Custom preset flag (check 'List available presets' for your ctq version)",
-                placeholder="e.g. krea2, zimage",
-            )
-            exclude_layers = gr.Textbox(
-                label="Exclude layers (regex, --exclude-layers) — leave unquantized (defaults to Krea2 K2 profile)",
-                value=KREA2_K2_DEFAULT_PATTERN,
-                placeholder=r"diffusion_model\.first\.",
-            )
-            scan_fp8_bias_btn = gr.Button("Scan checkpoint for FP8 biases (merge into exclude pattern)")
-            extra_flags = gr.Textbox(label="Extra raw CLI flags (advanced)", placeholder="--calib_samples 8192")
-
+    with gr.Tabs():
+        with gr.Tab("1. Dequantize FP8 -> BF16 (do this first if source is FP8)"):
             with gr.Row():
-                convert_btn = gr.Button("Convert", variant="primary")
-                list_presets_btn = gr.Button("List available presets")
+                with gr.Column():
+                    deq_file_input = gr.File(label="Upload checkpoint (.safetensors)", file_types=[".safetensors"])
+                    deq_path_input = gr.Textbox(
+                        label="Or local file path (recommended)",
+                        placeholder=r"C:\models\Soliloquy.safetensors",
+                    )
+                    deq_output_name = gr.Textbox(
+                        label="Output filename (optional)",
+                        placeholder="Soliloquy_bf16.safetensors",
+                    )
+                    with gr.Row():
+                        scan_scale_btn = gr.Button("Scan: scaled FP8 or naive FP8?")
+                        dequantize_btn = gr.Button("Dequantize to BF16", variant="primary")
+                with gr.Column():
+                    deq_log_output = gr.Textbox(label="Log", lines=20)
+                    deq_file_output = gr.File(label="Dequantized (BF16) checkpoint")
 
-        with gr.Column():
-            log_output = gr.Textbox(label="ctq output log", lines=20)
-            file_output = gr.File(label="Converted checkpoint")
+            scan_scale_btn.click(
+                scan_scale_metadata_ui,
+                inputs=[deq_file_input, deq_path_input],
+                outputs=[deq_log_output],
+            )
+            dequantize_btn.click(
+                run_dequantize,
+                inputs=[deq_file_input, deq_path_input, deq_output_name],
+                outputs=[deq_log_output, deq_file_output],
+            )
 
-    convert_btn.click(
-        run_conversion,
-        inputs=[file_input, path_input, output_name, use_int8, scaling_mode, block_size,
-                use_convrot, convrot_group_size, use_comfy_quant, save_metadata,
-                preset, custom_preset_flag, extra_flags, use_simple, use_low_memory,
-                exclude_layers],
-        outputs=[log_output, file_output],
-    )
-    list_presets_btn.click(list_presets, inputs=[], outputs=[log_output])
-    scan_fp8_bias_btn.click(
-        scan_for_fp8_biases,
-        inputs=[file_input, path_input, exclude_layers],
-        outputs=[log_output, exclude_layers],
-    )
+        with gr.Tab("2. INT8 ConvRot Conversion"):
+            gr.Markdown(
+                "Wraps the `ctq` CLI from "
+                "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant). "
+                "Point this at your BF16 file from step 1 (or an already-unquantized "
+                "checkpoint)."
+            )
+            with gr.Row():
+                with gr.Column():
+                    file_input = gr.File(label="Upload checkpoint (.safetensors)", file_types=[".safetensors"])
+                    path_input = gr.Textbox(
+                        label="Or local file path (recommended for large checkpoints)",
+                        placeholder=r"C:\models\Soliloquy_bf16.safetensors",
+                    )
+                    output_name = gr.Textbox(
+                        label="Output filename (optional)",
+                        placeholder="krea2_int8_convrot.safetensors",
+                    )
+
+                    use_int8 = gr.Checkbox(label="INT8 quantize (--int8)", value=True)
+                    scaling_mode = gr.Radio(["row", "tensor", "block"], value="row", label="Scaling mode")
+                    block_size = gr.Number(label="Block size (only used if scaling mode = block)", value=128, precision=0)
+
+                    use_simple = gr.Checkbox(
+                        label="Simple mode / skip learned rounding (--simple) — much faster, slightly lower fidelity",
+                        value=True,
+                    )
+                    use_low_memory = gr.Checkbox(label="Low memory mode (--low-memory)", value=True)
+
+                    use_convrot = gr.Checkbox(label="Apply ConvRot (Hadamard rotation)", value=True)
+                    convrot_group_size = gr.Radio(["64", "256", "1024"], value="256", label="ConvRot group size")
+
+                    use_comfy_quant = gr.Checkbox(label="ComfyUI-compatible metadata (--comfy_quant)", value=True)
+                    save_metadata = gr.Checkbox(label="Save quant metadata (--save-quant-metadata)", value=True)
+
+                    preset = gr.Dropdown(PRESET_CHOICES, value="(none)", label="Architecture preset (layer exclusions)")
+                    custom_preset_flag = gr.Textbox(
+                        label="Custom preset flag (check 'List available presets' for your ctq version)",
+                        placeholder="e.g. krea2, zimage",
+                    )
+                    exclude_layers = gr.Textbox(
+                        label="Exclude layers (regex, --exclude-layers) — leave unquantized (defaults to Krea2 K2 profile)",
+                        value=KREA2_K2_DEFAULT_PATTERN,
+                        placeholder=r"diffusion_model\.first\.",
+                    )
+                    scan_fp8_bias_btn = gr.Button("Scan checkpoint for FP8 biases (merge into exclude pattern)")
+                    extra_flags = gr.Textbox(label="Extra raw CLI flags (advanced)", placeholder="--calib_samples 8192")
+
+                    with gr.Row():
+                        convert_btn = gr.Button("Convert", variant="primary")
+                        list_presets_btn = gr.Button("List available presets")
+
+                with gr.Column():
+                    log_output = gr.Textbox(label="ctq output log", lines=20)
+                    file_output = gr.File(label="Converted checkpoint")
+
+            convert_btn.click(
+                run_conversion,
+                inputs=[file_input, path_input, output_name, use_int8, scaling_mode, block_size,
+                        use_convrot, convrot_group_size, use_comfy_quant, save_metadata,
+                        preset, custom_preset_flag, extra_flags, use_simple, use_low_memory,
+                        exclude_layers],
+                outputs=[log_output, file_output],
+            )
+            list_presets_btn.click(list_presets, inputs=[], outputs=[log_output])
+            scan_fp8_bias_btn.click(
+                scan_for_fp8_biases,
+                inputs=[file_input, path_input, exclude_layers],
+                outputs=[log_output, exclude_layers],
+            )
 
 if __name__ == "__main__":
     demo.launch(inbrowser=True)
