@@ -1,4 +1,4 @@
-# Krea2 INT8 ConvRot Converter
+# StormForgeAI Quant Factory
 
 A Gradio front end for `ctq` (from silveroxides/convert_to_quant), which quantizes
 safetensors checkpoints to INT8 with an optional Hadamard rotation (ConvRot) applied
