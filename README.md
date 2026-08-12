@@ -1,5 +1,4 @@
-# StormForgeAI Quant Factory
-
+# Krea2 INT8 ConvRot Converter
 
 A Gradio front end with two steps:
 1. **Dequantize FP8 -> BF16** — required if your source checkpoint is already FP8.
@@ -19,7 +18,7 @@ made via `UNETLoader` with `weight_dtype: fp8_e4m3fn_fast`, or downloaded as an
 `*_fp8*.safetensors` file), start on the Dequantize tab — don't feed it straight
 into ConvRot.**
 
-Many FP8 checkpoints store weights as `raw_fp8_value` plus a
+Why this matters: many FP8 checkpoints store weights as `raw_fp8_value` plus a
 **separate per-layer `.weight_scale` tensor**, where the real value is
 `raw_fp8_value.float() * weight_scale`. If a quantizer doesn't know about that
 scale tensor and treats the raw FP8 bits as the final weight, every value it
@@ -74,14 +73,17 @@ the smaller file size / faster inference and are willing to trade some
 fidelity for it.
 
 ## Loading the outputs in ComfyUI
-- **BF16 output**: load like any normal checkpoint with the standard
-  "Load Diffusion Model" node, `weight_dtype: default`.
-- **INT8 ConvRot output**: as of this writing, ComfyUI's *native* loader does
-  not reliably run this combination (INT8 + ConvRot specifically — its native
-  fast paths cover plain INT8 and 4-bit ConvRot, but not 8-bit ConvRot together).
-  Use a ConvRot-aware custom node instead — ComfyUI-INT8-Fast (or its
-  SparknightLLC fork) or WINT8-ComfyUI — and set that node's `model_type`
-  explicitly to `krea2` rather than `auto`.
+Both outputs now load through the standard **"Load Diffusion Model"** node,
+`weight_dtype: default` — no special custom node required for either variant.
+
+(Earlier versions of this app produced files that needed a ConvRot-aware
+custom node like ComfyUI-INT8-Fast with `model_type: krea2`, because the
+dequantize step was leaking leftover FP8-checkpoint quantization metadata
+into its output — see "Leftover quantization metadata" below. That's fixed
+now. If you're loading a file produced by an older version of this app, or
+still hit a `_params.clone()` / `'NoneType' object has no attribute 'clone'`
+crash on the native loader, re-run Dequantize + ConvRot with the current
+`app.py` first before reaching for a custom node.)
 
 ## Troubleshooting
 
@@ -108,11 +110,28 @@ in order:
 **`KeyError` on a `*.scale` tensor when loading in ComfyUI (e.g.
 `'txtfusion.layerwise_blocks.0.prenorm.scale'`)**
 This means a real model weight (a norm layer's learnable scale/gain
-parameter, not a quantization scale) was dropped during dequantization. Make
-sure you're on the current `app.py` — earlier versions had a bug that matched
-any tensor ending in `.scale`/`_scale` as a quantization-scale companion, which
-could delete legitimate weights sharing that naming pattern. Re-run Dequantize
-with the fixed version.
+parameter, not a quantization scale) was dropped during dequantization. Fixed
+in current `app.py` — earlier versions matched any tensor ending in
+`.scale`/`_scale` as a quantization-scale companion, which deleted legitimate
+weights sharing that naming pattern. Re-run Dequantize with the current version.
+
+**Leftover quantization metadata — `'NoneType' object has no attribute
+'clone'` in ComfyUI, or console shows `Found quantization metadata version 1`
+/ `Detected mixed precision quantization` on what should be a plain BF16 or
+freshly-ConvRot'd file**
+Fixed in current `app.py`. Earlier versions of Dequantize copied the source
+FP8 file's entire `__metadata__` block and any per-tensor `*.comfy_quant`
+marker tensors straight through into the "BF16" output, even though the
+actual weights were correctly converted to plain BF16. ComfyUI's loader saw
+those leftover markers, assumed the layer was still quantized, and crashed
+looking for companion quantized-tensor data that no longer existed. Since
+that contaminated BF16 file was also what got fed into the ConvRot step, the
+ConvRot output inherited the same problem downstream — which is why this
+used to look like ConvRot INT8 specifically needed a special custom node to
+load. It doesn't; that was this bug. Current `app.py` strips quantization
+metadata keys and `*.comfy_quant`-style marker tensors during Dequantize, and
+its log reports exactly what was stripped so you can confirm. Re-run
+Dequantize (and then ConvRot from that clean output) with the current version.
 
 **Conversion seems stuck / very slow**
 Check that PyTorch actually sees your GPU:
@@ -123,4 +142,3 @@ python -c "import torch; print(torch.cuda.is_available())"
 If `False`, ctq is running on CPU. Also make sure "Simple mode" (`--simple`) is
 checked — without it, `ctq` runs a much slower SVD-based learned-rounding
 optimization per tensor.
-
