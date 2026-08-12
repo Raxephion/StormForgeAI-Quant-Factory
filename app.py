@@ -137,17 +137,32 @@ def scan_scale_metadata_ui(uploaded_file, manual_path):
         return f"Error: {e}\n\n{traceback.format_exc()}"
 
 
+QUANT_METADATA_KEY_SUBSTRINGS = ["quant"]
+QUANT_MARKER_TENSOR_SUBSTRINGS = ["comfy_quant", "quant_config", ".qtype", ".quant_type"]
+
+
+def is_quant_marker_tensor(key):
+    lower = key.lower()
+    return any(s in lower for s in QUANT_MARKER_TENSOR_SUBSTRINGS)
+
+
 def dequantize_fp8_to_bf16(input_path, output_path, progress):
     tensors = {}
     metadata = {}
     stats_log = []
+    stripped_metadata_keys = []
+    dropped_marker_tensors = []
 
     with safe_open(str(input_path), framework="pt", device="cpu") as f:
         keys = list(f.keys())
         all_keys = set(keys)
         meta = f.metadata()
         if meta:
-            metadata.update(meta)
+            for k, v in meta.items():
+                if any(s in k.lower() for s in QUANT_METADATA_KEY_SUBSTRINGS):
+                    stripped_metadata_keys.append(k)
+                    continue
+                metadata[k] = v
 
         # Only mark a "*_scale"/"*.scale" tensor as consumed if it is the
         # confirmed companion of an actual FP8 weight tensor. Never skip by
@@ -173,6 +188,15 @@ def dequantize_fp8_to_bf16(input_path, output_path, progress):
         for i, key in enumerate(keys):
             progress((i + 1) / n, desc=f"Processing {key}")
             if key in consumed_keys:
+                continue
+            if is_quant_marker_tensor(key):
+                # Per-tensor quantization marker (e.g. a "*.comfy_quant" tag)
+                # left over from the source FP8 file. The output is plain
+                # BF16, so this marker must not carry over — leaving it in
+                # makes ComfyUI think the layer is still quantized and it
+                # will fail to find the (no-longer-present) companion
+                # quantized-tensor data at load time.
+                dropped_marker_tensors.append(key)
                 continue
 
             tensor = f.get_tensor(key)
@@ -201,8 +225,12 @@ def dequantize_fp8_to_bf16(input_path, output_path, progress):
 
     log = (
         f"Dequantized {n_dequant} FP8 tensors to BF16 (using embedded scale where found).\n"
-        f"Copied {n_copied} other tensors unchanged.\n\n"
-        f"Sample dequantized tensor stats (sanity check — values should look like "
+        f"Copied {n_copied} other tensors unchanged.\n"
+        f"Dropped {len(dropped_marker_tensors)} leftover quantization marker tensor(s)"
+        + (f": {', '.join(dropped_marker_tensors[:10])}" + (" ..." if len(dropped_marker_tensors) > 10 else "") if dropped_marker_tensors else "")
+        + f".\nStripped {len(stripped_metadata_keys)} quantization-related metadata key(s)"
+        + (f": {', '.join(stripped_metadata_keys)}" if stripped_metadata_keys else "")
+        + f".\n\nSample dequantized tensor stats (sanity check — values should look like "
         f"typical near-unit-scale weights, not near-zero or huge):\n"
         + "\n".join(stats_log)
         + f"\n\nSaved to: {output_path}"
