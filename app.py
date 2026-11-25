@@ -437,11 +437,6 @@ with gr.Blocks(title="Krea2 INT8 ConvRot Converter") as demo:
         "stored with a separate per-layer scale tensor that the quantizer doesn't "
         "know about. Dequantizing to BF16 first (using that embedded scale) fixes "
         "this before ConvRot ever runs.\n\n"
-        "**Note:** as of this writing, ComfyUI's native diffusion-model loader does "
-        "not reliably run Krea2 ConvRot INT8 checkpoints — use a ConvRot-aware "
-        "custom node (e.g. ComfyUI-INT8-Fast / its SparknightLLC fork, or "
-        "WINT8-ComfyUI), and set that node's `model_type` explicitly to `krea2` "
-        "rather than `auto`."
     )
 
     with gr.Tabs():
